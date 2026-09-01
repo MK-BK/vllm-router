@@ -97,6 +97,8 @@ struct Router {
     otlp_traces_endpoint: Option<String>,
     // KV connector for PD disaggregation ("nixl" or "mooncake")
     kv_connector: String,
+    /// Hide worker addresses in response IDs
+    hide_worker_address: bool,
 }
 
 impl Router {
@@ -237,6 +239,7 @@ impl Router {
                     });
                 }
             },
+            hide_worker_address: self.hide_worker_address,
         })
     }
 }
@@ -310,6 +313,7 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        hide_worker_address = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -372,6 +376,7 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        hide_worker_address: bool,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -433,6 +438,7 @@ impl Router {
             enable_trace,
             otlp_traces_endpoint,
             kv_connector,
+            hide_worker_address,
         })
     }
 
