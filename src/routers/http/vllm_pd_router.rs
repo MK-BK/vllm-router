@@ -61,6 +61,8 @@ pub struct VllmPDRouter {
     kv_connector: KvConnector,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
+    /// Hide worker addresses in response IDs
+    hide_worker_address: bool,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -373,12 +375,20 @@ impl VllmPDRouter {
     }
 
     /// Generate vLLM-specific request ID with prefill/decode addressing
-    fn generate_vllm_request_id(prefill_addr: &str, decode_addr: &str) -> String {
+    fn generate_vllm_request_id(
+        prefill_addr: &str,
+        decode_addr: &str,
+        hide_worker_address: bool,
+    ) -> String {
         let uuid = Uuid::new_v4().to_string().replace('-', "");
-        format!(
-            "___prefill_addr_{}___decode_addr_{}_{}",
-            prefill_addr, decode_addr, uuid
-        )
+        if hide_worker_address {
+            format!("___pd_{}", uuid)
+        } else {
+            format!(
+                "___prefill_addr_{}___decode_addr_{}_{}",
+                prefill_addr, decode_addr, uuid
+            )
+        }
     }
 
     /// Get ZMQ address for a worker URL using service discovery
@@ -786,7 +796,11 @@ impl VllmPDRouter {
             prefill_http, prefill_zmq, decode_http, decode_zmq, path
         );
 
-        let request_id = Self::generate_vllm_request_id(prefill_zmq, decode_zmq);
+        let request_id = Self::generate_vllm_request_id(
+            prefill_zmq,
+            decode_zmq,
+            self.hide_worker_address,
+        );
         debug!(
             "Generated vLLM request ID for P2P coordination: {}",
             request_id
@@ -1180,7 +1194,11 @@ impl VllmPDRouter {
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
         let decode_zmq_addr = self.get_zmq_address(decode_worker.base_url(), ServiceType::Decode);
-        let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
+        let request_id = Self::generate_vllm_request_id(
+            &prefill_zmq_addr,
+            &decode_zmq_addr,
+            self.hide_worker_address,
+        );
 
         debug!("Generated vLLM request ID: {}", request_id);
         debug!("🔍 vLLM Proxy Comparison:");
@@ -1620,6 +1638,7 @@ impl VllmPDRouter {
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+                hide_worker_address: ctx.router_config.hide_worker_address,
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -1709,6 +1728,7 @@ impl VllmPDRouter {
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info,
+                hide_worker_address: ctx.router_config.hide_worker_address,
             })
         }
     }

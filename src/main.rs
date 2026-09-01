@@ -338,6 +338,10 @@ struct CliArgs {
     /// KV connector type for PD disaggregation (nixl or mooncake)
     #[arg(long, value_enum, default_value_t = KvConnector::Nixl)]
     kv_connector: KvConnector,
+
+    /// Hide worker addresses in response IDs to avoid leaking internal topology
+    #[arg(long, default_value_t = false)]
+    hide_worker_address: bool,
 }
 
 impl CliArgs {
@@ -557,6 +561,7 @@ impl CliArgs {
             enable_profiling: self.profile,
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: self.kv_connector,
+            hide_worker_address: self.hide_worker_address,
         })
     }
 
