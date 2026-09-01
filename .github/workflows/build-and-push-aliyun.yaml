@@ -94,6 +94,7 @@ jobs:
           cache-from: ${{ steps.cache.outputs.cache_from }}
           cache-to: ${{ steps.cache.outputs.cache_to }}
           platforms: ${{ github.event.inputs.platforms || 'linux/amd64' }}
+          provenance: false
 
       - name: Print image info
         run: |
