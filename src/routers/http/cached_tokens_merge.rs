@@ -2,15 +2,16 @@
 //!
 //! Port of vllm-ascend#11630 ([BugFix] Report prefiller cached tokens in PD proxy).
 //!
-//! In PD disaggregated mode with prefix caching enabled, prefix cache hits happen
-//! on the prefiller, but the response returned to the client comes from the
-//! decoder, whose reported `cached_tokens` does not include the prefiller's
-//! prefix cache hits. These utilities extract the cached token count from the
-//! prefiller's response and inject it into the decode response — both the
-//! non-streaming JSON body and the final usage chunk of a streaming SSE
-//! response (the empty-`choices` chunk sent when `stream_options.include_usage`
-//! is enabled, or the nested `response.usage` of a Responses API
-//! `response.completed` event).
+//! In PD disaggregated mode, the response returned to the client comes from the
+//! decoder, whose reported `cached_tokens` counts KV received via transfer as
+//! cache hits — i.e. it reflects "not recomputed on decode" rather than real
+//! cross-request cache reuse. These utilities make the prefiller's number
+//! authoritative: whenever the prefill response carries a usage block, its
+//! cached token count (or 0 when it reports none) replaces the decode-side
+//! value in the client response — both the non-streaming JSON body and the
+//! final usage chunk of a streaming SSE response (the empty-`choices` chunk
+//! sent when `stream_options.include_usage` is enabled, or the nested
+//! `response.usage` of a Responses API `response.completed` event).
 
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
@@ -19,22 +20,30 @@ use tracing::debug;
 
 /// Extract the prefiller's cached token count from a prefill response JSON.
 ///
+/// When the prefill response carries a usage block, the prefiller's number is
+/// authoritative: the reported count is returned, and a missing details block
+/// means zero real cache hits (`Some(0)`). This prevents the decode-side view
+/// (which counts KV received via transfer as cached tokens) from leaking into
+/// client responses. `None` is returned only when the prefill response has no
+/// usable usage block, in which case the decode response is left untouched.
+///
 /// Supports both the OpenAI Chat/Completions format
 /// (`usage.prompt_tokens_details.cached_tokens`) and the Responses API format
-/// (`usage.input_tokens_details.cached_tokens`). Returns `None` when the
-/// prefiller did not report cached tokens.
+/// (`usage.input_tokens_details.cached_tokens`).
 pub fn extract_prefill_cached_tokens(prefill_json: &Value) -> Option<u64> {
     let usage = prefill_json.get("usage")?;
-    for key in ["prompt_tokens_details", "input_tokens_details"] {
-        if let Some(cached) = usage
-            .get(key)
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64)
-        {
-            return Some(cached);
-        }
+    if !usage.is_object() {
+        return None;
     }
-    None
+    let cached = ["prompt_tokens_details", "input_tokens_details"]
+        .iter()
+        .find_map(|key| {
+            usage
+                .get(key)
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        });
+    Some(cached.unwrap_or(0))
 }
 
 /// Inject the prefiller's cached token count into a usage object, creating or
@@ -293,15 +302,18 @@ mod tests {
     #[test]
     fn test_extract_prefill_cached_tokens_missing_or_invalid() {
         assert_eq!(extract_prefill_cached_tokens(&json!({})), None);
+        assert_eq!(extract_prefill_cached_tokens(&json!({"usage": null})), None);
+        // A usage block without details means zero real cache hits.
         assert_eq!(
             extract_prefill_cached_tokens(&json!({"usage": {"prompt_tokens": 5}})),
-            None
+            Some(0)
         );
+        // Invalid cached_tokens values degrade to zero, not passthrough.
         assert_eq!(
             extract_prefill_cached_tokens(&json!({
                 "usage": {"prompt_tokens_details": {"cached_tokens": "many"}}
             })),
-            None
+            Some(0)
         );
     }
 
