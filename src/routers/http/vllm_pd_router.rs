@@ -1,5 +1,6 @@
 // vLLM PD (Prefill-Decode) Router Implementation
 // This module extends PdRouterBase to handle vLLM-specific two-stage processing
+use super::cached_tokens_merge;
 use super::dp_utils;
 use super::logprobs_merge;
 use super::pd_router::PdRouterBase;
@@ -704,6 +705,9 @@ impl VllmPDRouter {
             RouterMetrics::record_pd_decode_error(decode_http);
         }
 
+        let prefiller_cached_tokens =
+            prefill_response_json.and_then(cached_tokens_merge::extract_prefill_cached_tokens);
+
         if needs_logprobs && !is_streaming {
             debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
 
@@ -724,6 +728,15 @@ impl VllmPDRouter {
                 debug!("Successfully merged logprobs from prefill and decode responses");
             } else {
                 warn!("No logprobs were merged (might be expected if logprobs not in response)");
+            }
+
+            if let Some(ct) = prefiller_cached_tokens {
+                if cached_tokens_merge::inject_cached_tokens_in_json(&mut decode_json, ct) {
+                    debug!(
+                        "Injected prefiller cached_tokens={} into decode response usage",
+                        ct
+                    );
+                }
             }
 
             let merged_body = serde_json::to_vec(&decode_json)
@@ -753,7 +766,13 @@ impl VllmPDRouter {
             for (name, value) in decode_headers.iter() {
                 response_builder = response_builder.header(name, value);
             }
-            let body = axum::body::Body::from_stream(decode_response.bytes_stream());
+            let body = match prefiller_cached_tokens {
+                Some(ct) => Body::from_stream(cached_tokens_merge::inject_cached_tokens_stream(
+                    decode_response.bytes_stream(),
+                    ct,
+                )),
+                None => Body::from_stream(decode_response.bytes_stream()),
+            };
             return response_builder.body(body).map_err(|e| {
                 format!(
                     "Failed to build streaming response from {}: {}",
@@ -764,12 +783,19 @@ impl VllmPDRouter {
 
         // Non-streaming, no logprobs: read entire body
         let decode_headers = decode_response.headers().clone();
-        let body = decode_response
+        let mut body = decode_response
             .bytes()
             .await
             .map_err(|e| format!("Failed to read decode response: {}", e))?;
+        let body_modified = match prefiller_cached_tokens {
+            Some(ct) => cached_tokens_merge::inject_cached_tokens_in_body(&mut body, ct),
+            None => false,
+        };
         let mut response_builder = axum::http::Response::builder().status(status);
         for (name, value) in decode_headers.iter() {
+            if body_modified && name == "content-length" {
+                continue;
+            }
             response_builder = response_builder.header(name, value);
         }
         response_builder
@@ -796,11 +822,8 @@ impl VllmPDRouter {
             prefill_http, prefill_zmq, decode_http, decode_zmq, path
         );
 
-        let request_id = Self::generate_vllm_request_id(
-            prefill_zmq,
-            decode_zmq,
-            self.hide_worker_address,
-        );
+        let request_id =
+            Self::generate_vllm_request_id(prefill_zmq, decode_zmq, self.hide_worker_address);
         debug!(
             "Generated vLLM request ID for P2P coordination: {}",
             request_id
@@ -1516,6 +1539,9 @@ impl VllmPDRouter {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let prefiller_cached_tokens =
+            cached_tokens_merge::extract_prefill_cached_tokens(&prefill_response_json);
+
         // If logprobs requested and non-streaming, merge prefill and decode logprobs
         if needs_logprobs && !is_streaming {
             debug!("Logprobs requested and non-streaming - merging prefill and decode logprobs");
@@ -1545,6 +1571,15 @@ impl VllmPDRouter {
                 debug!("Successfully merged logprobs from prefill and decode responses");
             } else {
                 warn!("No logprobs were merged (might be expected if logprobs not in response)");
+            }
+
+            if let Some(ct) = prefiller_cached_tokens {
+                if cached_tokens_merge::inject_cached_tokens_in_json(&mut decode_json, ct) {
+                    debug!(
+                        "Injected prefiller cached_tokens={} into decode response usage",
+                        ct
+                    );
+                }
             }
 
             // Serialize merged response
@@ -1579,12 +1614,46 @@ impl VllmPDRouter {
                 }
             }
 
-            let body = Body::from_stream(decode_response.bytes_stream());
-            response_builder
-                .body(body)
-                .map_err(|e| PDRouterError::NetworkError {
-                    message: format!("Failed to build response from {}: {}", decode_url, e),
-                })
+            if is_streaming {
+                let body = match prefiller_cached_tokens {
+                    Some(ct) => {
+                        Body::from_stream(cached_tokens_merge::inject_cached_tokens_stream(
+                            decode_response.bytes_stream(),
+                            ct,
+                        ))
+                    }
+                    None => Body::from_stream(decode_response.bytes_stream()),
+                };
+                response_builder
+                    .body(body)
+                    .map_err(|e| PDRouterError::NetworkError {
+                        message: format!("Failed to build response from {}: {}", decode_url, e),
+                    })
+            } else {
+                let mut body =
+                    decode_response
+                        .bytes()
+                        .await
+                        .map_err(|e| PDRouterError::NetworkError {
+                            message: format!(
+                                "Failed to read decode response from {}: {}",
+                                decode_url, e
+                            ),
+                        })?;
+                if let Some(ct) = prefiller_cached_tokens {
+                    if cached_tokens_merge::inject_cached_tokens_in_body(&mut body, ct) {
+                        debug!(
+                            "Injected prefiller cached_tokens={} into decode response usage",
+                            ct
+                        );
+                    }
+                }
+                response_builder
+                    .body(Body::from(body))
+                    .map_err(|e| PDRouterError::NetworkError {
+                        message: format!("Failed to build response from {}: {}", decode_url, e),
+                    })
+            }
         }
     }
 

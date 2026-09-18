@@ -1,5 +1,6 @@
 //! HTTP router implementations
 
+pub mod cached_tokens_merge;
 pub mod dp_utils;
 pub mod logprobs_merge;
 pub mod openai_router;
